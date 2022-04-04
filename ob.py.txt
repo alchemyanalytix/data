@@ -1,0 +1,441 @@
+# ORANGE BOOK JSON notebook is the start of a project to create a normalized version of the orangebook data
+# Ultimately want the orangebook data to feed into a broader data system
+
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import numpy as np
+import os
+import zipfile
+import re
+
+user_directory = '/home/sneaker/bunker'
+
+# Function to Download Zip Files from Site
+def download_url(url, save_path, chunk_size=128):
+    r = requests.get(url, stream=True)
+    with open(save_path, 'wb') as fd:
+        for chunk in r.iter_content(chunk_size=chunk_size):
+            fd.write(chunk)
+            
+# Import the running file 
+orangebook_update_df = pd.read_csv(user_directory + '/fda_files/orangebook/orangebook_scraper_log.csv')
+modified = [pd.to_datetime(date) for date in orangebook_update_df.last_modified]
+ob_file_dates = orangebook_update_df.file_date.tolist()
+
+# Set the FDA Site url that is intended to be scraped
+url = 'https://www.fda.gov/drugs/drug-approvals-and-databases/orange-book-data-files'
+response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+html = response.text
+soup = BeautifulSoup(html, "html5lib")
+
+a_tags = soup.find_all('a')
+
+file_location = []
+for tag in a_tags:
+    if 'orange book data files' in tag.text.lower():
+        file_location += [tag['href']] 
+        
+filelocation = file_location[0]
+url = 'https://www.fda.gov' + filelocation
+response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+
+header_dict = dict(response.headers)
+d = header_dict['Content-Disposition']
+filename = re.findall("filename=(.+)", d)[0]
+filename = filename.replace('"','')
+last_modified = pd.to_datetime(header_dict['Last-Modified'])
+filedate = filename.replace('EOBZIP_','').replace('.zip','').replace('_','-')
+
+if last_modified in modified:
+    pass
+else:
+    if filedate in ob_file_dates:
+        filedate = filedate+'('+str(last_modified.date())+')'
+    else:
+        pass
+    last_orangebook_update_df = pd.DataFrame([[filedate, last_modified, filelocation]], 
+                                        columns = ['file_date', 'last_modified', 'location'])
+
+    # Root path
+    path = user_directory + '/fda_files/orangebook/'
+    dir_path = path + str(filedate) + '/'
+
+    # Check whether the specified path is an existing directory or not  
+    isdir = os.path.isdir(dir_path)
+    #if true save the file down to the folder and note in the csv that the file has been saved successfully
+    #if false make a directory, save the file, and note in the csv that the file has been saved successfully
+    if isdir == True:
+        pass
+    else:
+        #makes a directory for the application number
+        os.mkdir(dir_path)
+
+    download_url(url, dir_path+filename)
+    
+    # Creates a list of all files in the directory
+    files = os.listdir(dir_path)
+
+    # Create the list of json zip files
+    zip_files = []
+    for item in files:
+        if '.zip' in item:
+            zip_files += [item]
+
+    # Unzip all JSON files and save down to drive
+    for file in zip_files:
+        with zipfile.ZipFile(dir_path + file,"r") as zip_ref:
+            zip_ref.extractall(dir_path)
+
+    # Delete all of the zip files
+    for file in zip_files:
+        os.remove(dir_path + file)
+        
+    orangebook_update_df = pd.concat([orangebook_update_df, last_orangebook_update_df])
+    orangebook_update_df.to_csv(user_directory + '/fda_files/orangebook/orangebook_scraper_log.csv', index=False)
+    
+    
+    # Not Sure why this is here
+    root_directory = user_directory + '/fda_files/orangebook/'
+
+    # Products
+    ob_products = pd.read_csv(dir_path + 'products.txt', sep='~')
+    ob_products.columns = ob_products.columns.str.lower()
+
+
+    column_list = list(ob_products.columns)
+    main_columns = ['appl_no', 'product_no','type','trade_name','ingredient']
+    for columns in main_columns:
+        column_list.remove(columns)
+    new_columns = main_columns + column_list
+    ob_products = ob_products[new_columns]
+
+
+    forms_and_routes = pd.DataFrame()
+    for item in ob_products['df;route'].tolist():
+        split_item = item.split(';')
+        form = split_item[0]
+        split_dosage_form = form.split(',')
+        dosage_forms = []
+        for form in split_dosage_form:
+            form = form.strip()
+            dosage_forms += [form]
+        dosage_form = ';'.join(dosage_forms)
+
+        route = split_item[1]
+
+        df = pd.DataFrame([[dosage_form, route]], columns = ['dosage_form', 'route'])
+        forms_and_routes = pd.concat([forms_and_routes, df])
+    forms_and_routes = forms_and_routes.reset_index(drop=True)  
+
+
+    ob_products = pd.concat([ob_products, forms_and_routes], axis=1)
+
+
+    dates = []
+    for date in ob_products.approval_date.tolist():
+        date = date.replace('Approved Prior to ','').strip()
+        dates += [date]
+
+    ob_products.approval_date = dates
+    ob_products.approval_date = pd.to_datetime(ob_products.approval_date)
+
+    ob_products.type = ob_products.type.replace('DISCN', 'DISCONTINUED')
+    ob_products.appl_type = ob_products.appl_type.replace('N', 'NDA')
+    ob_products.appl_type = ob_products.appl_type.replace('A', 'ANDA')
+
+    ob_products.route = ob_products.route.replace('ORAL-20', 'ORAL')
+    ob_products.route = ob_products.route.replace('ORAL-21', 'ORAL')
+    ob_products.route = ob_products.route.replace('ORAL-28', 'ORAL')
+    ob_products.route = ob_products.route.replace('N/A', np.nan)
+
+    clean_strengths = []
+    for item in ob_products.strength:
+        if isinstance(item, float):
+            clean_strengths += [(item, np.nan)]
+        else:
+            split_item = item.split(' **')
+            if len(split_item) == 1:
+                clean_strengths += [(item, np.nan)]
+            else:
+                clean_strengths += [(split_item[0].strip(), ' '.join(split_item[1:]).replace('*','').strip())]
+
+    clean_strengths_df = pd.DataFrame(clean_strengths, columns=['strength', 'notes'])
+    ob_products = ob_products.drop(columns = ['strength'])
+    ob_products = pd.concat([ob_products, clean_strengths_df], axis=1)
+
+    # WAS NOT Discontinued for safety / efficacy
+    ob_products.notes = ob_products.notes.replace('Federal Register determination that product was not discontinued or withdrawn for s or e reasons', 'Federal Register determination that product was not discontinued or withdrawn for safety or efficacy reasons')
+    ob_products.notes = ob_products.notes.replace('Federal Register determination that product was not withdrawn or discontinued for safety or efficacy reasons','Federal Register determination that product was not discontinued or withdrawn for safety or efficacy reasons')
+    ob_products.notes = ob_products.notes.replace('Federal Register notice that product was not discontinued or withdrawn for safety or efficacy reasons', 'Federal Register determination that product was not discontinued or withdrawn for safety or efficacy reasons')
+    ob_products.notes = ob_products.notes.replace('See current Annual Edition, 1.8 Description of Special Situations, Levothyroxine Sodium Federal Register determination that product was not discontinued or withdrawn for safety or efficacy reasons', 'Federal Register determination that product was not discontinued or withdrawn for safety or efficacy reasons')
+
+    # WAS Discontinued for safety / efficacy
+    ob_products.notes = ob_products.notes.replace('Federal Register determination that product was discontinued or withdrawn for s or e reasons', 'Federal Register determination that product was discontinued or withdrawn for safety or efficacy reasons')
+
+    # Replace route name
+    ob_products.route = ob_products.route.replace("IM-IV", "INTRAMUSCULAR, INTRAVENOUS")
+    
+    ob_products['last_updated'] = filedate
+
+    # Patents
+    ob_patents = pd.read_csv(dir_path + 'patent.txt', sep='~')
+    ob_patents.columns = ob_patents.columns.str.lower()
+
+
+    ob_patents.patent_expire_date_text = pd.to_datetime(ob_patents.patent_expire_date_text)
+
+
+    patent_info = pd.DataFrame()
+    for patent in ob_patents.patent_no.tolist():
+        split_patent = patent.split('*')
+        if len(split_patent) == 1:
+            patent_number = split_patent[0]
+            ped = np.nan
+        elif len(split_patent) == 2:
+            patent_number = split_patent[0]
+            ped = split_patent[1]
+        else:
+            print('error')
+
+        df = pd.DataFrame([[patent_number, ped]], columns = ['patent_number', 'ped'])
+        patent_info = pd.concat([patent_info, df])
+
+    patent_info = patent_info.reset_index(drop=True)
+    ob_patents = pd.concat([ob_patents, patent_info], axis=1)
+    ob_patents = ob_patents.drop(columns='patent_no')
+    ob_patents['last_updated'] = filedate
+    
+    app_product = []
+    for idx, row in ob_patents.iterrows():
+        app_number = str(row['appl_no']).zfill(6)
+        prod_num = str(row['product_no']).zfill(3)
+        patent_number = str(row['patent_number'])
+        app_product += [app_number + '-' + prod_num + '-' + patent_number]
+    ob_patents['application_product_patent_num'] = app_product
+
+
+    # Exclusivity
+    ob_exclusivity = pd.read_csv(dir_path + 'exclusivity.txt', sep='~')
+    ob_exclusivity.columns = ob_exclusivity.columns.str.lower()
+    ob_exclusivity.exclusivity_date = pd.to_datetime(ob_exclusivity.exclusivity_date)
+
+    app_product = []
+    for idx, row in ob_exclusivity.iterrows():
+        app_number = str(row['appl_no']).zfill(6)
+        prod_num = str(row['product_no']).zfill(3)
+        app_product += [app_number + '-' + prod_num ]
+    ob_exclusivity['application_product_num'] = app_product    
+    ob_exclusivity['last_updated'] = filedate
+
+    # Save files
+    ob_products.to_csv(dir_path + 'products.csv', index=False)
+    ob_patents.to_csv(dir_path + 'patents.csv', index=False)
+    ob_exclusivity.to_csv(dir_path + 'exclusivity.csv', index=False)
+    
+    
+    # Process the products file and update orangebook product file
+    app_product = []
+    for idx, row in ob_products.iterrows():
+        app_number = str(row['appl_no']).zfill(6)
+        prod_num = str(row['product_no']).zfill(3)
+        app_product += [app_number + '-' + prod_num ]
+    ob_products['application_product_num'] = app_product
+
+    ob_products['date_added'] = file_date
+
+    ob_products = ob_products.drop(columns=['df;route'])
+
+    ob_products = ob_products.rename(columns={'application_product_num':'applicationProductNumber',
+                               'appl_no':'applicationNumber', 'product_no':'productNumber', 
+                               'type':'productType', 'trade_name':'brandName',
+                               'applicant_full_name':'applicantFullName',
+                               'appl_type':'applicationType','te_code':'teCode',
+                               'approval_date':'approvalDate',
+                               'dosage_form':'dosageForm',
+                               'last_updated':'dateUpdated',
+                               'date_added':'dateAdded'})
+
+    ob_products = ob_products[['applicationProductNumber','applicationNumber', 'productNumber', 'productType', 'brandName',
+                               'ingredient', 'applicant', 'applicantFullName', 'applicationType', 'teCode', 'approvalDate',
+                               'rld', 'rs', 'dosageForm', 'route', 'strength', 'notes', 'dateUpdated',  'dateAdded']]
+
+    # create a list of new ob products
+    ob_product_list = ob_products.applicationProductNumber.tolist()
+
+    # Create a list from existing list of ob products
+    orangebook_product_df = pd.read_csv(user_directory + '/knowledge_base/orangebook_products.csv')
+    existing_product_list = orangebook_product_df.applicationProductNumber.tolist()
+
+
+    update = []
+    new = []
+    for product in ob_product_list:
+        if product in existing_product_list:
+            update += [product]
+        else:
+            new += [product]
+    # Create a df of products that have been updated        
+    update_df = pd.DataFrame(update, columns=['applicationProductNumber'])
+    update_df = pd.merge(update_df, ob_products, on='applicationProductNumber', how='left')
+    update_df = update_df.drop(columns='dateAdded')
+    # Extract the date that products first record
+    existing_update = pd.DataFrame(update, columns=['applicationProductNumber'])
+    existing_update = pd.merge(existing_update, orangebook_product_df, on='applicationProductNumber', how='left')
+    existing_update = existing_update[['applicationProductNumber', 'dateAdded']]
+    # Add the first added date to update df
+    update_df = pd.merge(update_df, existing_update, on='applicationProductNumber', how='left')
+
+    # Create a df of new adds
+    new_df = pd.DataFrame(new, columns=['applicationProductNumber'])
+    new_df = pd.merge(new_df, ob_products, on='applicationProductNumber', how='left')
+
+    # Construct df of legacy products to keep running records
+    legacy = []
+    for product in existing_product_list:
+        if product not in ob_product_list:
+            legacy += [product]
+    legacy_df = pd.DataFrame(legacy, columns=['applicationProductNumber'])
+    legacy_df = pd.merge(legacy_df, orangebook_product_df, on='applicationProductNumber', how='left')
+
+    # Recompile the df of ob products
+    updated_ob_df = pd.concat([legacy_df, update_df])
+    updated_ob_df = pd.concat([updated_ob_df, new_df]).drop_duplicates()
+
+    # Save down file of ob products
+    updated_ob_df.to_csv(user_directory + '/knowledge_base/orangebook_products.csv', index=False)
+
+
+    ob_patents['date_added'] = file_date
+    ob_patents = ob_patents.rename(columns={'application_product_num':'application_product_patent_num'})
+
+    ob_patents = ob_patents.rename(columns={'application_product_patent_num':'applicationProductPatentNumber',
+                                    'appl_no':'applicationNumber', 'product_no':'productNumber', 
+                                    'appl_type':'applicationType',
+                                    'patent_expire_date_text':'patentExpireDateText',
+                                    'drug_substance_flag':'drugSubstanceFlag',
+                                    'drug_product_flag':'drugProductFlag',
+                                    'patent_use_code':'patentUseCode',
+                                    'delist_flag':'delistFlag',
+                                    'submission_date':'submissionDate',
+                                    'patent_number':'patentNumber',
+                                    'last_updated':'dateUpdated',
+                                    'date_added':'dateAdded'})
+    ob_patents.applicationType = ob_patents.applicationType.replace('N', 'NDA')
+    ob_patents.applicationType = ob_patents.applicationType.replace('A', 'ANDA')
+
+    orangebook_patents_df = pd.read_csv(user_directory + '/knowledge_base/orangebook_patents.csv')
+
+    # create a list of new ob patents
+    ob_patent_list = ob_patents.applicationProductPatentNumber.tolist()
+    # create a list of existing ob patents
+    existing_patent_list = orangebook_patents_df.applicationProductPatentNumber.tolist()
+
+    update = []
+    new = []
+    for patent in ob_patent_list:
+        if patent in existing_patent_list:
+            update += [patent]
+        else:
+            new += [patent]
+
+    # Create a df of patents that have been updated        
+    update_df = pd.DataFrame(update, columns=['applicationProductPatentNumber'])
+    update_df = pd.merge(update_df, ob_patents, on='applicationProductPatentNumber', how='left')
+    update_df = update_df.drop(columns='dateAdded')
+
+    # Extract the date that patents first record
+    existing_update = pd.DataFrame(update, columns=['applicationProductPatentNumber'])
+    existing_update = pd.merge(existing_update, orangebook_patents_df, on='applicationProductPatentNumber', how='left')
+    existing_update = existing_update[['applicationProductPatentNumber', 'dateAdded']]
+    # Add the first added date to update df
+    update_df = pd.merge(update_df, existing_update, on='applicationProductPatentNumber', how='left')
+
+     # Create a df of new adds
+    new_df = pd.DataFrame(new, columns=['applicationProductPatentNumber'])
+    new_df = pd.merge(new_df, ob_patents, on='applicationProductPatentNumber', how='left')
+
+    # Construct df of legacy patents to keep running records
+    legacy = []
+    for product in existing_patent_list:
+        if product not in ob_patent_list:
+            legacy += [product]
+    legacy_df = pd.DataFrame(legacy, columns=['applicationProductPatentNumber'])
+    legacy_df = pd.merge(legacy_df, orangebook_patents_df, on='applicationProductPatentNumber', how='left')
+
+    # Recompile the df of ob patents
+    updated_ob_df = pd.concat([legacy_df, update_df])
+    updated_ob_df = pd.concat([updated_ob_df, new_df]).drop_duplicates()
+
+    # Save down file of ob patents
+    updated_ob_df.to_csv(user_directory + '/knowledge_base/orangebook_patents.csv', index=False)
+    
+    ob_exclusivity['date_added'] = file_date
+
+    # add id to be used to check records
+    ob_exclusivity['application_product_exclusivity'] = ob_exclusivity['application_product_num'] + '-' + ob_exclusivity['exclusivity_code']
+
+    # Rename columns
+    ob_exclusivity = ob_exclusivity.rename(columns={'application_product_num':'applicationProductNumber',
+                                        'appl_no':'applicationNumber', 'product_no':'productNumber', 
+                                        'appl_type':'applicationType',
+                                        'exclusivity_code':'ExclusivityCode',
+                                        'exclusivity_date':'ExclusivityDate',
+                                        'application_product_exclusivity':'applicationProductExclusivity',
+                                        'last_updated':'dateUpdated',
+                                        'date_added':'dateAdded'})
+
+    ob_exclusivity.applicationType = ob_exclusivity.applicationType.replace('N', 'NDA')
+    ob_exclusivity.applicationType = ob_exclusivity.applicationType.replace('A', 'ANDA')
+
+    ob_exclusivity = ob_exclusivity[['applicationProductExclusivity', 'applicationProductNumber', 'applicationType', 
+                                     'applicationNumber', 'productNumber', 'ExclusivityCode', 'ExclusivityDate', 
+                                     'dateUpdated', 'dateAdded']]
+
+    # read in exclusivity file
+    orangebook_exclusivity_df = pd.read_csv(user_directory + '/knowledge_base/orangebook_exclusivity.csv')
+
+    # create a list of new ob patents
+    ob_exclusivity_list = ob_exclusivity.applicationProductExclusivity.tolist()
+    # create a list of existing ob patents
+    existing_exclusivity_list = orangebook_exclusivity_df.applicationProductExclusivity.tolist()
+
+    update = []
+    new = []
+    for exclusivity in ob_exclusivity_list:
+        if exclusivity in existing_exclusivity_list:
+            update += [exclusivity]
+        else:
+            new += [exclusivity]
+
+    # Create a df of patents that have been updated        
+    update_df = pd.DataFrame(update, columns=['applicationProductExclusivity'])
+    update_df = pd.merge(update_df, ob_exclusivity, on='applicationProductExclusivity', how='left')
+    update_df = update_df.drop(columns='dateAdded')
+    update_df = update_df.drop_duplicates()
+
+    # Extract the date that patents first record
+    existing_update = pd.DataFrame(update, columns=['applicationProductExclusivity'])
+    existing_update = pd.merge(existing_update, orangebook_exclusivity_df, on='applicationProductExclusivity', how='left')
+    existing_update = existing_update[['applicationProductExclusivity', 'dateAdded']]
+    # Add the first added date to update df
+    update_df = pd.merge(update_df, existing_update, on='applicationProductExclusivity', how='left')
+
+    # Create a df of new adds
+    new_df = pd.DataFrame(new, columns=['applicationProductExclusivity'])
+    new_df = pd.merge(new_df, ob_exclusivity, on='applicationProductExclusivity', how='left')
+
+    # Construct df of legacy patents to keep running records
+    legacy = []
+    for exclusivity in existing_exclusivity_list:
+        if exclusivity not in ob_exclusivity_list:
+            legacy += [exclusivity]
+    legacy_df = pd.DataFrame(legacy, columns=['applicationProductExclusivity'])
+    legacy_df = pd.merge(legacy_df, orangebook_exclusivity_df, on='applicationProductExclusivity', how='left')
+
+    # Recompile the df of ob patents
+    updated_ob_df = pd.concat([legacy_df, update_df])
+    updated_ob_df = pd.concat([updated_ob_df, new_df]).drop_duplicates()
+
+    # Save down file of ob patents
+    updated_ob_df.to_csv(user_directory + '/knowledge_base/orangebook_exclusivity.csv', index=False)
